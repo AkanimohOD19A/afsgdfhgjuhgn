@@ -33,7 +33,7 @@ def get_db_data(query=None):
 
 class TaxAnalyzer:
     def __init__(self):
-        self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self.client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
         self.conversation_history = []
 
     def get_summary_stats(self, df, columns_of_interest=None):
