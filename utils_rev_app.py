@@ -12,7 +12,7 @@ load_dotenv()
 
 class RevenueReliabilityAnalyzer:
     def __init__(self):
-        self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self.client = Anthropic(api_key=st.secrets("ANTHROPIC_API_KEY"))
         self.conversation_history = []
 
     def analyze(self, df: pd.DataFrame, query: str) -> str:
