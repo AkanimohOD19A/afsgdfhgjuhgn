@@ -1,169 +1,197 @@
 import os
+import requests
 import sqlite3
-import streamlit as st
 import pandas as pd
-import numpy as np
+from datetime import datetime
 from dotenv import load_dotenv
 from anthropic import Anthropic
-from datetime import datetime
 
 load_dotenv()
 
 
-def get_db_data(query=None):
-    """Retrieve data from SQLite database with improved error handling"""
-    try:
-        conn = sqlite3.connect("tax_data.db")
-        if query is None:
-            query = """
-            SELECT *
-            FROM tax_form_basic_data
-            ORDER BY tax_period_end DESC
-            """
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return pd.DataFrame()
-    finally:
-        if 'conn' in locals():
-            conn.close()
-
-
 class TaxAnalyzer:
-    def __init__(self):
-        self.client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    def __init__(self, model="claude-3-sonnet-20240229", max_tokens=1500, temperature=0.7):
+        self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))  # Uses ANTHROPIC_API_KEY from environment
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
         self.conversation_history = []
+        self.data_context = {}
+        self.col_order = [
+            'ein', 'business_name', 'formation_year', 'tax_period_begin',
+            'tax_period_end', 'total_revenue', 'total_expenses', 'net_income',
+            'net_assets_boy', 'net_assets_eoy', 'total_contributions',
+            'program_service_revenue', 'program_services_expenses',
+            'bond_proceeds', 'royalties', 'rental_property_income',
+            'net_fundraising', 'sales_of_assets', 'net_inventory_sales',
+            'investment_income', 'other_revenue', 'unrelated_business_revenue',
+            'related_or_exempt_func_income', 'operating_margin',
+            'executive_compensation', 'professional_fundraising_fees',
+            'other_salaries_and_wages', 'other_compensations',
+            'total_employees', 'total_volunteers', 'fundraising_expenses',
+            'management_and_general_expenses', 'total_assets_boy',
+            'total_assets_eoy', 'total_liabilities_boy', 'total_liabilities_eoy',
+            'compensation_from_other_srcs', 'contrct_rcvd_greater_than_100k',
+            'total_comp_greater_than_150k', 'indiv_rcvd_greater_than_100k',
+            'tot_reportable_comp_rltd_org', 'program_efficiency',
+            'exclusion_amount', 'group_return_for_affiliates',
+            'total_gross_ubi', 'voting_members_governing_body',
+            'voting_members_independent', 'website'
+        ]
 
-    def get_summary_stats(self, df, columns_of_interest=None):
-        """Get summary statistics for specified columns"""
-        if columns_of_interest is None:
-            columns_of_interest = [
-                'total_revenue', 'total_expenses', 'program_service_expenses',
-                'admin_expenses', 'fundraising_expenses', 'total_assets',
-                'total_liabilities', 'net_assets'
-            ]
+    def prep_data(self, df):
+        # Remove rows with empty 'tax_period_end'
+        df = df[df['tax_period_end'].notnull() & (df['tax_period_end'] != '')]
 
-        stats = {}
-        for col in columns_of_interest:
-            if col in df.columns:
-                stats[col] = {
-                    'mean': df[col].mean(),
-                    'median': df[col].median(),
-                    'std': df[col].std()
-                }
-        return stats
+        # Drop rows with missing 'business_name'
+        df = df.dropna(subset=['business_name'])
 
-    def analyze(self, df: pd.DataFrame, df_x: pd.DataFrame, query: str, ein_selected: str) -> str:
+        # Convert specific columns to lowercase
+        cols_to_lower = ['business_name', 'website']
+        df[cols_to_lower] = df[cols_to_lower].apply(lambda x: x.str.lower())
+
+        # Replace invalid strings and NaN with zeros
+        df = df.replace(['', 'NA', 'false', 'true'], [None, None, False, True])
+
+        numeric_cols = [
+            'total_revenue', 'net_assets_eoy', 'net_assets_boy',
+            'total_expenses', 'total_contributions', 'program_service_revenue',
+            'total_comp_greater_than_150k', 'compensation_from_other_srcs'
+        ]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Convert specific columns to boolean-like values
+        bool_like_cols = ['group_return_for_affiliates', 'compensation_from_other_srcs', 'total_comp_greater_than_150k']
+        for col in bool_like_cols:
+            df[col] = df[col].astype(bool)
+
+        # Convert date columns
+        date_cols = ['tax_period_begin', 'tax_period_end']
+        df[date_cols] = df[date_cols].apply(pd.to_datetime, errors='coerce')
+        df['formation_year'] = pd.to_datetime(df['formation_year'], format='%Y', errors='coerce')
+
+        # Calculate derived columns
+        df['net_income'] = df['total_revenue'] - df['net_assets_eoy']
+
+        # Reorder columns
+        cleaned_dataframe = df[self.col_order]
+
+        return cleaned_dataframe
+
+    def build_context(self, df):
+        """Build comprehensive context for the analysis"""
+        context_str = "COMPREHENSIVE DATASET ANALYSIS:\n\n"
+
+        # 1. Dataset Overview
+        context_str += "1. DATASET OVERVIEW:\n"
+        context_str += f"- Total Records: {df.shape[0]}\n"
+        context_str += f"- Unique Organizations: {df['business_name'].nunique()}\n"
+        context_str += f"- Date Range: {df['tax_period_end'].min()} to {df['tax_period_end'].max()}\n"
+
+        # 2. Financial Overview
+        context_str += "\n2. FINANCIAL METRICS:\n"
+        context_str += f"- Total Revenue Range: ${df['total_revenue'].min():,.2f} to ${df['total_revenue'].max():,.2f}\n"
+        context_str += f"- Average Revenue: ${df['total_revenue'].mean():,.2f}\n"
+        context_str += f"- Total Assets Range: ${df['total_assets_eoy'].min():,.2f} to ${df['total_assets_eoy'].max():,.2f}\n"
+        context_str += f"- Average Net Income: ${df['net_income'].mean():,.2f}\n"
+
+        # 3. Organizational Metrics
+        context_str += "\n3. ORGANIZATIONAL METRICS:\n"
+        context_str += f"- Average Employees: {df['total_employees'].mean():,.0f}\n"
+        context_str += f"- Average Volunteers: {df['total_volunteers'].mean():,.0f}\n"
+        context_str += f"- Organizations with Websites: {df['website'].notnull().sum()}\n"
+
+        # 4. Revenue Trends
+        context_str += "\n4. REVENUE TRENDS BY YEAR:\n"
+        revenue_trends = df.groupby(df['tax_period_end'].dt.year).agg({
+            'total_revenue': ['count', 'mean', 'sum'],
+            'operating_margin': 'mean'
+        }).round(2)
+        context_str += revenue_trends.to_string() + "\n"
+
+        # 5. Top Organizations
+        context_str += "\n5. TOP ORGANIZATIONS BY REVENUE:\n"
+        top_orgs = df.nlargest(10, 'total_revenue')[['business_name', 'total_revenue', 'total_employees', 'operating_margin']]
+        for _, row in top_orgs.iterrows():
+            context_str += f"- {row['business_name']}: ${row['total_revenue']:,.2f} | "
+            context_str += f"Employees: {row['total_employees']:,.0f} | "
+            context_str += f"Margin: {row['operating_margin']}%\n"
+
+        # 6. Program Efficiency
+        context_str += "\n6. PROGRAM EFFICIENCY METRICS:\n"
+        context_str += f"- Average Program Efficiency: {df['program_efficiency'].mean():,.2f}%\n"
+        context_str += f"- Program Services vs Total Expenses: {(df['program_services_expenses'].sum() / df['total_expenses'].sum() * 100):,.2f}%\n"
+
+        # 7. Compensation Insights
+        context_str += "\n7. COMPENSATION INSIGHTS:\n"
+        context_str += f"- Average Executive Compensation: ${df['executive_compensation'].mean():,.2f}\n"
+        context_str += f"- Organizations with High Compensation (>150k): {df['total_comp_greater_than_150k'].sum()}\n"
+
+        # 8. Full Dataset Access
+        context_str += "\n8. FULL DATASET ACCESS:\n"
+        context_str += "All financial metrics, organizational data, and historical trends are available for analysis.\n"
+        context_str += "Available columns for analysis: " + ", ".join(self.col_order) + "\n"
+
+        return context_str
+
+    def get_response(self, user_input, df=None):
+        """Generate a contextual response to user input"""
         try:
-            keywords = ["peer", "compare"]
-            needs_comparison = any(keyword in query.lower() for keyword in keywords)
-
-            # Start with minimal context
-            context = "Analysis Context:\n\n"
-            context += f"Dataset Overview:\n"
-            context += f"Total Organizations: {df_x['business_name'].nunique()}\n"
-            context += f"Date Range: {df_x['tax_period_begin'].min()} to {df_x['tax_period_end'].max()}\n\n"
-
-            if needs_comparison:
-                # Get most recent year's data for comparison
-                latest_year = df_x['tax_period_end'].max()
-                recent_data = df_x[df_x['tax_period_end'] == latest_year]
-
-                # Calculate and include only relevant summary stats
-                relevant_columns = [
-                    'total_revenue', 'total_expenses', 'program_service_expenses',
-                    'admin_expenses', 'fundraising_expenses'
-                ]
-                stats = self.get_summary_stats(recent_data, relevant_columns)
-
-                context += "Industry Statistics (Most Recent Year):\n"
-                for metric, values in stats.items():
-                    context += f"\n{metric}:\n"
-                    for stat_name, value in values.items():
-                        if pd.notnull(value):
-                            formatted_value = f"${value:,.2f}" if any(term in metric.lower() for term in
-                                                                      ['revenue', 'expenses', 'assets',
-                                                                       'liabilities']) else f"{value:,.2f}"
-                            context += f"- {stat_name}: {formatted_value}\n"
-
-                # Add selected organization's metrics if available
-                if ein_selected != "General Context":
-                    selected_data = df[df['tax_period_end'] == latest_year]
-                    if not selected_data.empty:
-                        context += "\nSelected Organization Metrics:\n"
-                        for col in relevant_columns:
-                            if col in selected_data.columns:
-                                value = selected_data[col].iloc[0]
-                                if pd.notnull(value):
-                                    formatted_value = f"${value:,.2f}" if any(term in col.lower() for term in
-                                                                              ['revenue', 'expenses', 'assets',
-                                                                               'liabilities']) else f"{value:,.2f}"
-                                    context += f"- {col}: {formatted_value}\n"
+            if df is not None:
+                context = self.build_context(df)
             else:
-                # For non-comparison queries, only include relevant data for the selected EIN
-                if ein_selected != "General Context":
-                    selected_df = df[df['ein'] == ein_selected].copy()
-                    if not selected_df.empty:
-                        # Get most recent record
-                        latest_record = selected_df.loc[selected_df['tax_period_end'].idxmax()]
-                        context += f"\nMost Recent Data for {latest_record['business_name']}:\n"
+                context = "No data context available."
 
-                        # Include only the most relevant fields
-                        relevant_fields = [
-                            'business_name', 'tax_period_end', 'total_revenue',
-                            'total_expenses', 'program_service_expenses', 'admin_expenses',
-                            'fundraising_expenses', 'total_assets', 'total_liabilities',
-                            'net_assets', 'employee_count', 'volunteer_count'
-                        ]
+            # Combine context with conversation history
+            full_prompt = f"{context}\n\nQuestion: {user_input}\n\nProvide detailed analysis using all available metrics and historical data."
 
-                        for field in relevant_fields:
-                            if field in latest_record.index and pd.notnull(latest_record[field]):
-                                value = latest_record[field]
-                                if isinstance(value, (int, float)):
-                                    formatted_value = f"${value:,.2f}" if any(term in field.lower() for term in
-                                                                              ['revenue', 'expenses', 'assets',
-                                                                               'liabilities']) else f"{value:,}"
-                                else:
-                                    formatted_value = value
-                                context += f"- {field}: {formatted_value}\n"
+            # Create system message
+            system_message = """You are a financial analyst specialized in nonprofit tax records analysis.
+            Use the complete dataset to provide comprehensive insights.
+            Consider all available metrics, trends, and patterns in your analysis.
+            Make connections between different data points to provide deeper insights.
+            Support your analysis with specific numbers and trends from the data."""
 
-            # Add only the last 2 relevant conversation items
-            if self.conversation_history:
-                context += "\nRecent Conversation Context:\n"
-                for q, a in self.conversation_history[-2:]:
-                    context += f"\nQ: {q}\nA: {a}\n"
-
-            # System message focused on efficiency analysis
-            system_message = """You are analyzing nonprofit tax records with a focus on program efficiency. For each analysis:
-                1. Calculate and compare program efficiency ratios:
-                   - Program spending ratio (program expenses / total expenses)
-                   - Administrative expense ratio
-                   - Fundraising efficiency
-                2. Compare against peer organizations when relevant
-                3. Provide specific data-backed insights
-                4. Suggest potential areas for improvement
-                5. Keep responses concise and focused on key metrics"""
-
+            # Get response using the Anthropic client
             response = self.client.messages.create(
-                model="claude-3-sonnet-20240229",
+                model=self.model,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
                 system=system_message,
-                messages=[{
-                    "role": "user",
-                    "content": f"Based on the following tax records:\n\n{context}\n\nQuestion: {query}"
-                }],
-                max_tokens=1500
+                messages=[
+                    *[{"role": msg["role"], "content": msg["content"]} for msg in self.conversation_history],
+                    {"role": "user", "content": full_prompt}
+                ]
             )
 
-            answer = response.content[0].text if response.content else "Unable to generate analysis"
-            answer = answer.replace("$,", "$").replace("  ", " ").replace(" .", ".")
+            # Extract response text
+            assistant_reply = response.content[0].text
 
-            self.conversation_history.append((query, answer))
+            # Update conversation history
+            self.conversation_history.append({"role": "user", "content": user_input})
+            self.conversation_history.append({"role": "assistant", "content": assistant_reply})
+
+            # Maintain reasonable history length
             if len(self.conversation_history) > 10:
-                self.conversation_history.pop(0)
+                self.conversation_history = self.conversation_history[-10:]
 
-            return answer
+            return assistant_reply
 
         except Exception as e:
-            return f"Error analyzing records: {str(e)}"
+            print(f"Error in get_response: {str(e)}")  # Add debugging print
+            return f"Error generating response: {str(e)}"
+
+    def chat(self, query):
+        """Main interface for chatting with the bot"""
+        try:
+            # Get and prepare data
+            df = pd.read_csv("tax_filing_glimpse.csv")
+            cleaned_df = self.prep_data(df)
+
+            # Generate response
+            return self.get_response(query, cleaned_df)
+
+        except Exception as e:
+            print(f"Error in chat: {str(e)}")
+            return f"Error processing request: {str(e)}"
