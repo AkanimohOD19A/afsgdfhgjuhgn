@@ -55,7 +55,7 @@ if prompt := st.chat_input("Ask a question about financial health..."):
                 message_placeholder.text(full_response + "▌")
 
         # Finalize response display
-        message_placeholder.markdown(full_response)
+        message_placeholder.text(full_response)
 
     # Add assistant response to chat history
     st.session_state.messages.append({"role": "assistant", "content": full_response})
