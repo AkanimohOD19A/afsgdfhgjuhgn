@@ -151,7 +151,8 @@ class TaxAnalyzer:
             Use the complete dataset to provide comprehensive insights.
             Consider all available metrics, trends, and patterns in your analysis.
             Make connections between different data points to provide deeper insights.
-            Support your analysis with specific numbers and trends from the data."""
+            Support your analysis with specific numbers and trends from the data.
+            Keep to a concise and straight forward answer except when told to elaborate"""
 
             # Get response using the Anthropic client
             response = self.client.messages.create(
